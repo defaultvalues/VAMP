@@ -1,353 +1,317 @@
 import numpy as np
-from scipy.special import ndtr  # numerically stable normal CDF
-from matplotlib import pyplot as plt
-
-class NonnegativeVAMP:
-    def __init__(self, G, sigma2=1e-2, lam=0.1):
-        self.G = G
-        self.M, self.N = G.shape
-        self.sigma2 = sigma2
-        self.lam = lam
-
-        # SVD
-        self.U, self.S, self.Vt = np.linalg.svd(G, full_matrices=False)
-
-    def run(self, z, max_iter=30):
-
-        U, S, Vt = self.U, self.S, self.Vt
-        V = Vt.T
-
-        # init
-        x = np.zeros(self.N)
-        tau_x = 1.0
-
-        for t in range(max_iter):
-
-            # -------------------------
-            # MODULE A: Linear MMSE
-            # -------------------------
-
-            z_tilde = U.T @ z
-
-            shrink = S / (S**2 + self.sigma2)
-
-            x_A = V @ (shrink * z_tilde)
-
-            tau_A = np.mean(self.sigma2 / (S**2 + self.sigma2))
-
-            # -------------------------
-            # MODULE B: Nonnegative denoiser
-            # -------------------------
-
-            r = x_A  # VAMP coupling
-
-            tau_B = tau_A + 1e-12
-
-            x_new = np.maximum(r - self.lam * tau_B, 0)
-
-            # variance update
-            tau_x = np.mean(x_new > 0) * tau_B
-
-            x = x_new
-
-        return x
 
 
-class my_VAMP:
+def generate_block_sparse_signal(n, block_size, active_prob, sigma_x2=1.0, rng=None):
+    """Generate a complex block-sparse signal with Bernoulli-Gaussian block prior."""
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if n % block_size != 0:
+        raise ValueError("n must be divisible by block_size")
+
+    g = n // block_size
+    x = np.zeros(n, dtype=np.complex128)
+
+    for i in range(g):
+        if rng.random() < active_prob:
+            start = i * block_size
+            end = start + block_size
+            real = rng.standard_normal(block_size)
+            imag = rng.standard_normal(block_size)
+            x[start:end] = np.sqrt(sigma_x2 / 2.0) * (real + 1j * imag)
+
+    return x
+
+
+def module1_block_bg(
+    r2_t,
+    gamma2_t,
+    active_prob,
+    sigma_x2,
+    block_size,
+):
     """
-    Correct VAMP for linear model z = G x + noise, x >= 0, x ~ Exp(lam).
+    Module 1 (denoising):
+        q1^(t)(x) propto p(x) * N(x; r2^(t), (gamma2^(t))^{-1} I)
 
-    Two-module message-passing loop:
-      Module A: Linear MMSE using SVD, outputs extrinsic (r̂₁, γ₁)
-      Module B: Truncated-Gaussian MMSE denoiser (nonneg exponential prior),
-                outputs extrinsic (r̂₂, γ₂)
-    Both modules exchange *extrinsic* (self-removed) messages each iteration.
+    Returns:
+        x1_hat_t = E_{q1^(t)}[x]
+        eta1_t   = ( (1/N) Tr(Cov_{q1^(t)}(x)) )^{-1}
+
+    Prior per block x_i (length d):
+        p(x_i) = (1-lambda) delta(x_i) + lambda CN(0, sigma_x2 I)
+    Incoming message:
+        CN(x; r2, gamma2^{-1} I)
     """
+    n = r2_t.size
+    if n % block_size != 0:
+        raise ValueError("Signal length must be divisible by block_size")
 
-    def __init__(self, G, sigma2=1e-2, lam=0.1, damping=0.8, prior="trunc_exp", rho=0.05):
-        self.G = G
-        self.M, self.N = G.shape
-        self.sigma2 = sigma2
-        self.lam = lam
-        self.damping = damping
-        self.prior = prior
+    g = n // block_size
+    d = block_size
 
-        rho_arr = np.asarray(rho, dtype=float)
-        if rho_arr.ndim == 0:
-            self.rho_vec = np.full(self.N, float(rho_arr))
-        elif rho_arr.size == self.N:
-            self.rho_vec = rho_arr.reshape(self.N)
-        else:
-            raise ValueError("rho must be a scalar or an array of length N.")
-        # Keep scalar-like API for backward compatibility in user code.
-        self.rho = float(self.rho_vec[0]) if np.allclose(self.rho_vec, self.rho_vec[0]) else self.rho_vec
+    c_scalar = sigma_x2 / (1.0 + gamma2_t * sigma_x2)
+    alpha = (gamma2_t * sigma_x2) / (1.0 + gamma2_t * sigma_x2)
 
-        # precompute SVD once
-        self.U, self.S, self.Vt = np.linalg.svd(G, full_matrices=False)
+    x1_hat_t = np.zeros_like(r2_t)
+    tr_cov_sum = 0.0
 
-        if self.prior not in ("trunc_exp", "bernoulli_exp"):
-            raise ValueError("prior must be 'trunc_exp' or 'bernoulli_exp'.")
-        if np.any((self.rho_vec <= 0.0) | (self.rho_vec >= 1.0)):
-            raise ValueError("all rho values must be in (0, 1).")
+    eps = 1e-16
+    active_prob = float(np.clip(active_prob, eps, 1.0 - eps))
 
-    # ------------------------------------------------------------------
-    # Module B: MMSE denoiser for p(x) = lam*exp(-lam*x), x >= 0
-    #   Effective channel: r = x + N(0, 1/gamma)
-    #   Posterior: x | r  ~  TruncatedNormal(mu_eff = r - lam/gamma,
-    #                                         var = 1/gamma,  support [0, inf))
-    # Returns:
-    #   x_hat      : MMSE estimate
-    #   alpha      : average Jacobian E[dg/dr] (needed for extrinsic)
-    #   post_var   : element-wise posterior variance estimate
-    # ------------------------------------------------------------------
-    def _module_B_trunc_exp(self, r_hat, gamma):
-        sigma = 1.0 / np.sqrt(np.maximum(gamma, 1e-30))
-        mu_eff = r_hat - self.lam / np.maximum(gamma, 1e-30)
-        t = np.clip(mu_eff / sigma, -50.0, 50.0)   # clip prevents t**2 overflow
+    for i in range(g):
+        start = i * d
+        end = start + d
+        r = r2_t[start:end]
+        norm2 = float(np.vdot(r, r).real)
 
-        phi = np.exp(-0.5 * t ** 2) / np.sqrt(2 * np.pi)
-        Phi = ndtr(t)                               # P(N(0,1) <= t)
+        # Log-domain posterior active probability for numerical stability.
+        # Complex-valued CN likelihood:
+        # CN(r; 0, v I) = (pi v)^(-d) * exp(-||r||^2 / v)
+        v0 = 1.0 / gamma2_t
+        v1 = sigma_x2 + v0
 
-        safe = Phi > 1e-10
-        mills = np.where(safe, phi / np.where(safe, Phi, 1.0), 0.0)
+        # p(r_i | inactive) = CN(r_i; 0, gamma2^{-1} I)
+        log_p_inactive = d * (np.log(gamma2_t) - np.log(np.pi)) - gamma2_t * norm2
+        # p(r_i | active) = CN(r_i; 0, (sigma_x2 + gamma2^{-1}) I)
+        log_p_active = -d * np.log(np.pi * v1) - norm2 / v1
 
-        x_hat = np.maximum(np.where(safe, mu_eff + sigma * mills, 0.0), 0.0)
+        log_a = np.log(active_prob) + log_p_active
+        log_i = np.log(1.0 - active_prob) + log_p_inactive
+        log_z = np.logaddexp(log_a, log_i)
+        pi_i = float(np.exp(log_a - log_z))
 
-        # dg/dr = 1 - t*mills - mills^2  (= posterior var * gamma)
-        alpha_vec = np.where(safe, 1.0 - t * mills - mills ** 2, 0.0)
-        alpha = np.maximum(np.mean(alpha_vec), 1e-10)
-        post_var = np.maximum(alpha_vec / np.maximum(gamma, 1e-30), 1e-20)
+        mu_i = alpha * r
+        xhat_i = pi_i * mu_i
 
-        return x_hat, alpha, post_var
+        x1_hat_t[start:end] = xhat_i
 
-    def _module_B_bernoulli_exp(self, r_hat, gamma):
-        """
-        MMSE denoiser for Bernoulli-Exponential prior:
-                    p(x_n) = (1-rho_n) delta(x_n) + rho_n * lam * exp(-lam*x_n), x_n>=0
-        Effective channel: r = x + N(0, 1/gamma)
-        """
-        tau = 1.0 / np.maximum(gamma, 1e-30)
-        sigma = np.sqrt(tau)
+        tr_cov_i = pi_i * d * c_scalar + pi_i * (1.0 - pi_i) * float(np.vdot(mu_i, mu_i).real)
+        tr_cov_sum += tr_cov_i
 
-        mu_eff = r_hat - self.lam * tau
-        t = np.clip(mu_eff / sigma, -50.0, 50.0)
-        phi = np.exp(-0.5 * t ** 2) / np.sqrt(2 * np.pi)
-        Phi = np.maximum(ndtr(t), 1e-12)
-        kappa = phi / Phi
+    avg_var = tr_cov_sum / n
+    eta1_t = 1.0 / max(avg_var, 1e-16)
 
-        # Active branch posterior moments (truncated Gaussian)
-        m1 = np.maximum(mu_eff + sigma * kappa, 0.0)
-        v1 = tau * np.maximum(1.0 - t * kappa - kappa ** 2, 1e-12)
+    return x1_hat_t, eta1_t
 
-        # Stable posterior active probability w = P(active | r)
-        logZ0 = -0.5 * (np.log(2.0 * np.pi * tau) + (r_hat ** 2) / tau)
-        logZ1 = (
-            np.log(self.lam)
-            - self.lam * r_hat
-            + 0.5 * (self.lam ** 2) * tau
-            + np.log(Phi)
+
+def module2_lmmse_svd(y, r1_t, gamma1_t, gamma_w, svd_cache):
+    """
+    Module 2 (linear MMSE):
+        x2_hat^(t) and eta2^(t) from LMMSE with incoming N(x; r1^(t), (gamma1^(t))^{-1} I).
+    """
+    u, s, vh, n = svd_cache
+
+    v = vh.conj().T
+    k = s.size
+
+    uy = u.conj().T @ y
+    vr = v.conj().T @ r1_t
+
+    den = gamma1_t + gamma_w * (s ** 2)
+    coeff_y = gamma_w * s / den
+    coeff_r = gamma1_t / den
+
+    # Component in span(V)
+    x_span = v @ (coeff_y * uy + coeff_r * vr)
+    # Null-space component unchanged by linear measurements
+    x_null = r1_t - v @ vr
+    x2_hat_t = x_span + x_null
+
+    tr_c2_t = (n - k) / gamma1_t + np.sum(1.0 / den)
+    eta2_t = 1.0 / max((tr_c2_t.real / n), 1e-16)
+
+    return x2_hat_t, eta2_t
+
+
+def vamp_block_sparse(
+    y,
+    a,
+    gamma_w,
+    block_size,
+    active_prob,
+    sigma_x2,
+    max_iter=100,
+    tol=1e-6,
+    gamma2_init=1.0,
+    damping=1.0,
+    min_precision=1e-12,
+):
+    """
+     VAMP algorithm with block Bernoulli-Gaussian prior, matching the tutorial equations.
+
+     Iteration t:
+     1) Module 1:
+         q1^(t), x1_hat^(t), eta1^(t)
+     2) Extrinsic to Module 2:
+         gamma1^(t) = eta1^(t) - gamma2^(t)
+         r1^(t)     = (eta1^(t) x1_hat^(t) - gamma2^(t) r2^(t)) / gamma1^(t)
+     3) Module 2:
+         x2_hat^(t), eta2^(t)
+     4) Extrinsic to Module 1:
+         gamma2^(t+1) = eta2^(t) - gamma1^(t)
+         r2^(t+1)     = (eta2^(t) x2_hat^(t) - gamma1^(t) r1^(t)) / gamma2^(t+1)
+    """
+    y = np.asarray(y)
+    a = np.asarray(a)
+
+    m, n = a.shape
+    if y.shape[0] != m:
+        raise ValueError("Shape mismatch: y must have length equal to A.shape[0]")
+    if n % block_size != 0:
+        raise ValueError("A.shape[1] must be divisible by block_size")
+    if gamma_w <= 0:
+        raise ValueError("gamma_w must be positive")
+    if not np.iscomplexobj(a):
+        raise ValueError("Complex-only mode: A must be complex-valued")
+    if not np.iscomplexobj(y):
+        raise ValueError("Complex-only mode: y must be complex-valued")
+
+    dtype = np.complex128
+
+    # Initialization in Algorithm 1.
+    r2_t = np.zeros(n, dtype=dtype)
+    gamma2_t = float(max(gamma2_init, min_precision))
+
+    u, s, vh = np.linalg.svd(a, full_matrices=False)
+    svd_cache = (u, s, vh, n)
+
+    x2_hat_prev = np.zeros(n, dtype=dtype)
+    history = []
+
+    converged = False
+    for t in range(max_iter):
+        # Module 1: x1_hat^(t), eta1^(t)
+        x1_hat_t, eta1_t = module1_block_bg(
+            r2_t=r2_t,
+            gamma2_t=gamma2_t,
+            active_prob=active_prob,
+            sigma_x2=sigma_x2,
+            block_size=block_size,
         )
-        log_num = np.log(self.rho_vec) + logZ1
-        log_den0 = np.log(1.0 - self.rho_vec) + logZ0
-        delta = np.clip(log_den0 - log_num, -60.0, 60.0)
-        w = 1.0 / (1.0 + np.exp(delta))
 
-        x_hat = w * m1
-        post_var = np.maximum(w * (v1 + m1 ** 2) - x_hat ** 2, 1e-20)
+        # Extrinsic update to Module 2.
+        gamma1_raw_t = eta1_t - gamma2_t
+        gamma1_t = max(gamma1_raw_t, min_precision)
+        r1_t = (eta1_t * x1_hat_t - gamma2_t * r2_t) / gamma1_t
 
-        # Posterior-mean denoiser identity for AWGN channel: dE[x|r]/dr = Var[x|r]/tau
-        alpha_vec = np.clip(post_var / np.maximum(tau, 1e-30), 1e-12, 1.0)
-        alpha = float(np.maximum(np.mean(alpha_vec), 1e-10))
+        # Module 2: x2_hat^(t), eta2^(t)
+        x2_hat_t, eta2_t = module2_lmmse_svd(
+            y=y,
+            r1_t=r1_t,
+            gamma1_t=gamma1_t,
+            gamma_w=gamma_w,
+            svd_cache=svd_cache,
+        )
 
-        return x_hat, alpha, post_var
+        # Extrinsic update to Module 1.
+        gamma2_raw_tp1 = eta2_t - gamma1_t
+        gamma2_tp1 = damping * gamma2_raw_tp1 + (1.0 - damping) * gamma2_t
+        gamma2_tp1 = max(float(gamma2_tp1), min_precision)
 
-    def _module_B(self, r_hat, gamma):
-        if self.prior == "trunc_exp":
-            return self._module_B_trunc_exp(r_hat, gamma)
-        return self._module_B_bernoulli_exp(r_hat, gamma)
+        r2_tp1 = (eta2_t * x2_hat_t - gamma1_t * r1_t) / gamma2_tp1
 
-    def _prior_moments(self):
-        if self.prior == "trunc_exp":
-            mean0 = 1.0 / self.lam
-            var0 = 1.0 / (self.lam ** 2)
-            return mean0, var0
-
-        # Bernoulli-Exponential moments
-        mean0 = self.rho_vec / self.lam
-        second_moment = 2.0 * self.rho_vec / (self.lam ** 2)
-        var0 = np.maximum(second_moment - mean0 ** 2, 1e-12)
-        return mean0, var0
-
-    def run(self, z, max_iter=50, tol=1e-7, return_info=False):
-        U, S, Vt = self.U, self.S, self.Vt
-        V = Vt.T
-        z_tilde = U.T @ z   # project observation once: shape (M,)
-        d = S ** 2 / self.sigma2  # (M,) d_i = s_i² / sigma²
-
-        # --- Initialisation ---
-        # gamma_2: precision of the prior message from Module B → Module A
-        prior_mean, prior_var = self._prior_moments()
-        prior_mean_vec = np.full(self.N, prior_mean) if np.ndim(prior_mean) == 0 else np.asarray(prior_mean, dtype=float)
-        prior_var_vec = np.full(self.N, prior_var) if np.ndim(prior_var) == 0 else np.asarray(prior_var, dtype=float)
-        prior_var_eff = float(np.maximum(np.mean(prior_var_vec), 1e-12))
-
-        gamma_2 = 1.0 / prior_var_eff
-        r_hat_2 = np.array(prior_mean_vec, copy=True)
-        x_hat = np.zeros(self.N)
-        post_var = np.array(prior_var_vec, copy=True)
-        converged = False
-
-        for it in range(max_iter):
-
-            # ============================================================
-            # Module A: Linear MMSE
-            #   Prior on x: N(r̂₂, γ₂⁻¹ I)
-            #   x̂₁ = (AᵀA/σ² + γ₂ I)⁻¹ (Aᵀz/σ² + γ₂ r̂₂)
-            # Using SVD: B⁻¹ = V diag(1/(d_i+γ₂)) Vᵀ + (1/γ₂)(I - VVᵀ)
-            # ============================================================
-            r_tilde = Vt @ r_hat_2                  # (M,)
-            coeff = (S * z_tilde / self.sigma2 + gamma_2 * r_tilde) / (d + gamma_2)
-            x_hat_1 = V @ coeff + (r_hat_2 - V @ r_tilde)  # null-space += r̂₂ component
-
-            # α₁ = mean over M row-space dims only (no null-space term).
-            # Including (N-M)/γ₂ causes γ₁ → ∞ as γ₂ → ∞, leading to overflow.
-            alpha_1 = max(float(np.mean(1.0 / (d + gamma_2))), 1e-10)
-
-            # Extrinsic A → B:  remove Module B's prior contribution
-            gamma_1 = np.clip(1.0 / alpha_1 - gamma_2, 1e-10, 1e8)
-            r_hat_1 = np.clip(
-                (x_hat_1 / alpha_1 - gamma_2 * r_hat_2) / gamma_1,
-                -1e4, 1e4
-            )
-
-            # ============================================================
-            # Module B: Nonneg exponential MMSE denoiser
-            # ============================================================
-            x_hat_2, alpha_2, post_var_2 = self._module_B(r_hat_1, gamma_1)
-            alpha_2 = max(alpha_2, 1e-10)
-
-            # Extrinsic B → A:  remove Module A's message contribution
-            raw_gamma_2_new = 1.0 / alpha_2 - gamma_1
-            if raw_gamma_2_new > 1e-10:
-                # Normal extrinsic update
-                gamma_2_new = min(raw_gamma_2_new, 1e8)
-                r_hat_2_new = np.clip(
-                    (x_hat_2 / alpha_2 - gamma_1 * r_hat_1) / gamma_2_new,
-                    -1e4, 1e4
-                )
-            else:
-                # Module A is more precise than Module B's posterior.
-                # Dividing by ≈0 would blow up r_hat_2.  Instead, send Module B's
-                # estimate back as the next prior with a weak precision.
-                gamma_2_new = 1.0 / prior_var_eff
-                r_hat_2_new = x_hat_2
-
-            # Convergence
-            change = np.max(np.abs(x_hat_2 - x_hat))
-
-            # Damping on messages (not on estimate)
-            gamma_2 = self.damping * gamma_2_new + (1 - self.damping) * gamma_2
-            r_hat_2 = self.damping * r_hat_2_new + (1 - self.damping) * r_hat_2
-            x_hat = x_hat_2
-            post_var = post_var_2
-
-            if change < tol:
-                print(f"  VAMP converged at iteration {it + 1}")
-                converged = True
-                break
-
-        if return_info:
-            info = {
-                "converged": converged,
-                "iterations": it + 1,
-                "posterior_var": post_var,
-                "posterior_std": np.sqrt(post_var),
+        rel_change = np.linalg.norm(x2_hat_t - x2_hat_prev) / (np.linalg.norm(x2_hat_t) + 1e-12)
+        history.append(
+            {
+                "iter": t + 1,
+                "rel_change": float(rel_change),
+                "eta1": float(eta1_t),
+                "eta2": float(eta2_t),
+                "gamma1": float(gamma1_t),
+                "gamma2": float(gamma2_tp1),
             }
-            return x_hat, info
-        return x_hat
+        )
 
-    def plot_estimate_with_variance(self, x_hat, post_var, x_true=None, top_k=None):
-        """
-        Visualize estimate and posterior uncertainty.
-        If top_k is set, only plot the largest top_k entries of x_hat.
-        """
-        idx = np.arange(x_hat.size)
-        if top_k is not None and top_k < x_hat.size:
-            sel = np.argsort(x_hat)[-top_k:]
-            sel = np.sort(sel)
-            idx = sel
+        x2_hat_prev = x2_hat_t.copy()
+        r2_t = r2_tp1
+        gamma2_t = gamma2_tp1
 
-        x_plot = x_hat[idx]
-        std_plot = np.sqrt(np.maximum(post_var[idx], 0.0))
+        if rel_change < tol:
+            print(f"Converged at iteration {t+1} with relative change {rel_change:.2e}")
+            converged = True
+            break
 
-        plt.figure(figsize=(12, 7))
-        plt.subplot(2, 1, 1)
-        if x_true is not None:
-            plt.stem(idx, x_true[idx], linefmt='g-', markerfmt='go', basefmt=' ', label='True')
-            plt.stem(idx, x_plot, linefmt='r-', markerfmt='ro', basefmt=' ', label='Estimated')
-            plt.legend()
-        else:
-            plt.stem(idx, x_plot, linefmt='r-', markerfmt='ro', basefmt=' ', label='Estimated')
-            plt.legend()
-        plt.title('VAMP Estimate')
-        plt.ylabel('Amplitude')
+    if not converged:
+        print("Not Converged !")
 
-        plt.subplot(2, 1, 2)
-        plt.stem(idx, post_var[idx], linefmt='b-', markerfmt='bo', basefmt=' ')
-        plt.title('Posterior Variance')
-        plt.xlabel('Index')
-        plt.ylabel('Variance')
-        plt.tight_layout()
-        plt.show()
+    return {"x_hat": x2_hat_prev, "history": history}
 
+
+def demo():
+    rng = np.random.default_rng()
+
+    m = 300
+    n = 400
+    block_size = 8
+
+    active_prob = 0.2
+    sigma_x2 = 1.0
+
+    x_true = generate_block_sparse_signal(
+        n=n,
+        block_size=block_size,
+        active_prob=active_prob,
+        sigma_x2=sigma_x2,
+        rng=rng,
+    )
+
+    a = (rng.standard_normal((m, n)) + 1j * rng.standard_normal((m, n))) / np.sqrt(2.0 * m)
+
+    snr_db = 10.0
+    signal_power = np.mean(np.abs(a @ x_true) ** 2)
+    noise_power = signal_power / (10.0 ** (snr_db / 10.0))
+    noise_std = np.sqrt(noise_power / 2.0)
+
+    w = noise_std * (rng.standard_normal(m) + 1j * rng.standard_normal(m))
+    y = a @ x_true + w
+
+    gamma_w = 1.0 / max(noise_power, 1e-16)
+
+    result = vamp_block_sparse(
+        y=y,
+        a=a,
+        gamma_w=gamma_w,
+        block_size=block_size,
+        active_prob=active_prob,
+        sigma_x2=sigma_x2,
+        max_iter=500,
+        tol=1e-7,
+        gamma2_init=1.0,
+        damping=1.0,
+    )
+
+    x_hat = result["x_hat"]
+    nmse = np.linalg.norm(x_hat - x_true) ** 2 / (np.linalg.norm(x_true) ** 2 + 1e-16)
+
+    print("VAMP block sparse recovery demo")
+    print(f"iterations: {len(result['history'])}")
+    print(f"NMSE: {10 * np.log10(nmse + 1e-16):.2f} dB")
+
+    # Compare magnitudes for complex signals.
+    import matplotlib.pyplot as plt
+    idx = np.arange(n)
+    support_mask = np.abs(x_true) > 1e-10
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    axes[0].stem(idx, np.abs(x_true), linefmt='b-', markerfmt='bo', label='|True Signal|')
+    axes[0].stem(idx, np.abs(x_hat), linefmt='r-', markerfmt='ro', label='|Estimated Signal|')
+    axes[0].set_title('Complex Block Sparse Signal Recovery via VAMP')
+    axes[0].set_ylabel('Magnitude')
+    axes[0].legend()
+    axes[0].grid()
+
+    axes[1].plot(idx[support_mask], np.angle(x_true[support_mask]), 'bo', label='angle(x_true)')
+    axes[1].plot(idx[support_mask], np.angle(x_hat[support_mask]), 'r.', label='angle(x_hat)')
+    axes[1].set_xlabel('Index')
+    axes[1].set_ylabel('Phase (rad)')
+    axes[1].set_title('Phase Recovery on True Support')
+    axes[1].legend()
+    axes[1].grid()
+
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-
-    M, N = 400, 400
-
-    # sensing matrix (NONNEGATIVE as in your model)
-    G = np.abs(np.random.randn(M, N))
-
-    # 构造一个不均匀的G，使得某些列的范数较大，增加稀疏信号恢复的难度
-    # col_norms = np.linalg.norm(G, axis=0)
-    # scaling_factors = 1.0 + 5.0 * (col_norms - np.min(col_norms)) / (np.max(col_norms) - np.min(col_norms) + 1e-12)
-    # G *= scaling_factors
-
-    # 构造一个托普利兹矩阵作为G的特殊结构示例
-    from scipy.linalg import toeplitz
-    c = np.random.rand(M)
-    r = np.random.rand(N)
-    G = toeplitz(c, r)
-
-    # 让G的能量集中在一些低维子空间，增加恢复难度
-    # U, S, Vt = np.linalg.svd(G, full_matrices=False)
-    # S = np.exp(np.linspace(4.0, -1.0, min(M, N)))  # 快速衰减的奇异值
-    # G = U @ np.diag(S) @ Vt
-
-    # sparse gamma (true signal)
-    gamma_true = np.zeros(N)
-    idx = np.random.choice(N, 4, replace=False)
-    gamma_true[idx] = np.abs(np.random.rand(4) * 1)
-
-    # observations
-    target_snr_db = 20
-    signal_power = np.mean((G @ gamma_true) ** 2)
-    sigma2 = signal_power / (10 ** (target_snr_db / 10))
-    noise = np.sqrt(sigma2) * np.random.randn(M)
-    z = G @ gamma_true + noise
-
-    rho_vec = np.zeros(N) + 0.01  # 设置大部分位置的先验激励概率较低
-    # rho_vec[idx] = 0.5  # 设置非零位置的先验激励概率较高
-
-    # run VAMP
-    vamp = my_VAMP(G, sigma2=sigma2, lam=0.8, prior="bernoulli_exp", rho=rho_vec)
-    gamma_est, info = vamp.run(z, max_iter=100, tol=1e-3, return_info=True)
-    print("Converged:", info["converged"], "Iterations:", info["iterations"])
-    print("Posterior variance mean:", float(np.mean(info["posterior_var"])))
-
-    vamp.plot_estimate_with_variance(
-        x_hat=gamma_est,
-        post_var=info["posterior_var"],
-        x_true=gamma_true,
-        top_k=80,
-    )
+    demo()
