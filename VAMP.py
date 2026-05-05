@@ -1,3 +1,9 @@
+"""
+Written by Chenmin Sha, 2026-05-05
+mail: scm21@mails.tsinghua.edu.cn
+"""
+
+
 import numpy as np
 
 
@@ -63,7 +69,7 @@ def module1_block_bg(
         start = i * d
         end = start + d
         r = r2_t[start:end]
-        norm2 = float(np.vdot(r, r).real)
+        norm2 = np.sum(np.abs(r)**2)
 
         # Log-domain posterior active probability for numerical stability.
         # Complex-valued CN likelihood:
@@ -245,7 +251,7 @@ def demo():
     n = 400
     block_size = 8
 
-    active_prob = 0.2
+    active_prob = 0.1
     sigma_x2 = 1.0
 
     x_true = generate_block_sparse_signal(
@@ -258,7 +264,7 @@ def demo():
 
     a = (rng.standard_normal((m, n)) + 1j * rng.standard_normal((m, n))) / np.sqrt(2.0 * m)
 
-    snr_db = 10.0
+    snr_db = 15.0
     signal_power = np.mean(np.abs(a @ x_true) ** 2)
     noise_power = signal_power / (10.0 ** (snr_db / 10.0))
     noise_std = np.sqrt(noise_power / 2.0)
